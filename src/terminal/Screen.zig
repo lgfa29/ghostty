@@ -2454,15 +2454,25 @@ fn clearPromptForRedraw(
             },
 
             .true => {
+                // Limit the upward prompt search to the active area so we
+                // don't walk into scrollback. In a small split the current
+                // prompt's tagged row may have scrolled off; without a
+                // limit the iterator skips .none rows indefinitely and
+                // can find an old prompt deep in history, then the
+                // downward clear wipes all the content in between.
+                //
+                // The limit pin's x must match the cursor pin's x because
+                // promptIterator uses Pin.eql (which compares x) and
+                // Pin.up preserves x as it walks rows.
+                var active_tl = self.pages.getTopLeft(.active);
+                active_tl.x = self.cursor.page_pin.x;
+
                 const start = start: {
                     var it = self.cursor.page_pin.promptIterator(
                         .left_up,
-                        null,
+                        active_tl,
                     );
                     break :start it.next() orelse {
-                        // This should never happen because promptIterator should always
-                        // find a prompt if we already verified our row is some kind of
-                        // prompt.
                         log.warn("cursor on prompt line but promptIterator found no prompt", .{});
                         break :prompt;
                     };
@@ -2471,7 +2481,9 @@ fn clearPromptForRedraw(
                 // Clear cells from our start down. We replace it with spaces,
                 // and do not physically erase the rows (eraseRows) because the
                 // shell is going to expect this space to be available.
-                var it = start.rowIterator(.right_down, null);
+                const active_br = self.pages.getBottomRight(.active) orelse
+                    break :prompt;
+                var it = start.rowIterator(.right_down, active_br);
                 while (it.next()) |pin| {
                     const page = pin.node.page();
                     const row = pin.rowAndCell().row;
@@ -9652,6 +9664,90 @@ test "Screen: resize with prompt_redraw last multiline prompt clears only last l
         defer alloc.free(contents);
         const expected = "line1\nline2";
         try testing.expectEqualStrings(expected, contents);
+    }
+}
+
+test "Screen: resize with prompt_redraw does not clear scrollback" {
+    // Regression test: in a small split, the cursor can be on a row with
+    // semantic_content = .input but semantic_prompt = .none (e.g. an
+    // unmarked continuation line). The prompt clearing search walked
+    // upward with no limit, skipping .none rows and finding an OLD
+    // prompt in scrollback, then clearing everything from there down.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Very small active area (3 rows) to force content into scrollback.
+    var s = try init(io, alloc, .{ .cols = 10, .rows = 3, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+
+    // zig fmt: off
+
+    // First command cycle: prompt, input, output.
+    // This output is BELOW the prompt and will be wiped by the bug.
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> cmd1\n");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    s.cursorSetSemanticContent(.output);
+    try s.testWriteString("out_A\n");
+    try s.testWriteString("out_B\n");
+
+    // Second command cycle to push everything further into scrollback.
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> cmd2\n");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    s.cursorSetSemanticContent(.output);
+    try s.testWriteString("out_C\n");
+    try s.testWriteString("out_D\n");
+
+    // Third prompt. Write enough to push the prompt row off the
+    // active area into scrollback.
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> cmd3\n");
+    // Use .output for continuation lines to avoid auto-tagging them
+    // as prompt_continuation, simulating shells that don't mark
+    // continuation lines (like Nu).
+    s.cursorSetSemanticContent(.output);
+    try s.testWriteString("typing1\n");
+    try s.testWriteString("typing2\n");
+    // Restore .input on the final row to trigger the prompt clearing
+    // path during resize.
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("typing3");
+    // zig fmt: on
+
+    // Cursor is on a .none row with semantic_content = .input.
+    try testing.expect(s.cursor.semantic_content == .input);
+    try testing.expectEqual(
+        @as(pagepkg.Row.SemanticPrompt, .none),
+        s.cursor.page_row.semantic_prompt,
+    );
+
+    // Verify scrollback has cmd3's prompt (which is just above the
+    // active area and will be found by the buggy upward search).
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
+        defer alloc.free(contents);
+        try testing.expect(std.mem.indexOf(u8, contents, "> cmd3") != null);
+        try testing.expect(std.mem.indexOf(u8, contents, "typing1") != null);
+    }
+
+    // Resize (zoom out): grows cols and rows.
+    try s.resize(.{
+        .cols = 20,
+        .rows = 6,
+        .prompt_redraw = .true,
+    });
+
+    // Before the fix, the prompt search walked into scrollback,
+    // found "> cmd3" just above the active area, and cleared from
+    // there to the end — destroying scrollback rows. With the fix,
+    // the search is bounded to the active area and scrollback is
+    // untouched.
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
+        defer alloc.free(contents);
+        try testing.expect(std.mem.indexOf(u8, contents, "> cmd3") != null);
     }
 }
 
