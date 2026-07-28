@@ -51,11 +51,15 @@ class SurfaceScrollView: NSView {
         documentView = NSView(frame: NSRect(origin: .zero, size: contentSize))
         scrollView.documentView = documentView
 
-        // The document view contains our actual surface as a child.
-        // We synchronize the scrolling of the document with this surface
-        // so that our primary Ghostty renderer only needs to render the viewport.
-        documentView.addSubview(surfaceView)
-
+        // The document view is where the surface lives once we're on screen. We
+        // synchronize the scrolling of the document with the surface so that our
+        // primary Ghostty renderer only needs to render the viewport.
+        //
+        // We deliberately don't take the surface as a subview here: it's shared,
+        // it can only have one superview, and SwiftUI may build a scroll view for
+        // a surface and then throw it away without ever showing it. Taking the
+        // surface in init would leave the scroll view that IS on screen empty.
+        // See "Surface Ownership" below.
         super.init(frame: .zero)
 
         // Our scroll view is our only view
@@ -73,6 +77,19 @@ class SurfaceScrollView: NSView {
             queue: .main
         ) { [weak self] notification in
             self?.handleScrollChange(notification)
+        })
+
+        // Another scroll view for our surface gave it up, so take it if we're the
+        // one on screen. This runs synchronously on the posting thread (the main
+        // thread) so the surface is never left unhosted for a frame.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .ghosttySurfaceNeedsHost,
+            object: surfaceView,
+            queue: nil
+        ) { [weak self] notification in
+            let wasFocused = notification.userInfo?[
+                SwiftUI.Notification.Name.SurfaceNeedsHostFocusedKey] as? Bool ?? false
+            self?.adoptSurfaceIfNeeded(restoringFocus: wasFocused)
         })
 
         // Listen for scrollbar updates from Ghostty
@@ -159,6 +176,16 @@ class SurfaceScrollView: NSView {
         observers.forEach { NotificationCenter.default.removeObserver($0) }
     }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+
+        if window != nil {
+            adoptSurfaceIfNeeded()
+        } else {
+            relinquishSurface()
+        }
+    }
+
     // The entire bounds is a safe area, so we override any default
     // insets. This is necessary for the content view to match the
     // surface view if we have the "hidden" titlebar style.
@@ -169,6 +196,15 @@ class SurfaceScrollView: NSView {
 
         // Fill entire bounds with scroll view
         scrollView.frame = bounds
+
+        // If we're on screen we should be the one hosting the surface. This also
+        // recovers the surface if another scroll view took it and then went away.
+        adoptSurfaceIfNeeded()
+
+        // Everything below manipulates the shared surface view, so it's only ours
+        // to do while we're the scroll view hosting it.
+        guard hostsSurface else { return }
+
         surfaceView.frame.size = scrollView.bounds.size
 
         // We only set the width of the documentView here, as the height depends
@@ -179,6 +215,65 @@ class SurfaceScrollView: NSView {
         synchronizeScrollView()
         synchronizeSurfaceView()
         synchronizeCoreSurface()
+    }
+
+    // MARK: Surface Ownership
+
+    /// Whether the shared surface view is currently hosted by us.
+    ///
+    /// The surface view is shared: it outlives any particular scroll view (it's
+    /// owned by the split tree) and can only have one superview. Several scroll
+    /// views can exist for the same surface at once, because SwiftUI rebuilds this
+    /// part of the hierarchy whenever the split tree changes (a zoom toggle, for
+    /// example) and may keep the outgoing views around for a transition.
+    private var hostsSurface: Bool {
+        surfaceView.superview === documentView
+    }
+
+    /// Takes the surface view if we're the one on screen and don't already have it.
+    ///
+    /// - Parameter restoringFocus: Whether to make the surface the first responder
+    ///   again. Leaving the view hierarchy makes the surface resign, so the host
+    ///   taking over has to hand keyboard focus back or the terminal would look
+    ///   fine but ignore everything typed into it.
+    private func adoptSurfaceIfNeeded(restoringFocus: Bool = false) {
+        guard let window, !hostsSurface else { return }
+        documentView.addSubview(surfaceView)
+        needsLayout = true
+
+        // Take keyboard focus back if the surface had it, or if nothing in the
+        // window has it: a first responder that leaves the view hierarchy leaves
+        // the window itself as the responder, and then everything typed is
+        // dropped. We never take focus away from another view that has it, which
+        // includes the other splits and the search field.
+        guard window.firstResponder !== surfaceView else { return }
+        let windowHasFocusedView = window.firstResponder is NSView
+        if restoringFocus || !windowHasFocusedView {
+            window.makeFirstResponder(surfaceView)
+        }
+    }
+
+    /// Gives the surface view up when we leave the window.
+    ///
+    /// Without this, a scroll view that SwiftUI discards after briefly displaying
+    /// it would take the surface out of the window with it, leaving the scroll
+    /// view that's still on screen blank and unable to receive events.
+    private func relinquishSurface() {
+        guard hostsSurface else { return }
+
+        // Read this before unparenting: removing a view from the hierarchy makes
+        // it resign first responder.
+        let wasFocused = surfaceView.window?.firstResponder === surfaceView
+
+        surfaceView.removeFromSuperview()
+
+        // Let any other scroll view for this surface pick it back up. This is
+        // posted synchronously so the handover happens within this same layout
+        // pass rather than after a frame of emptiness.
+        NotificationCenter.default.post(
+            name: .ghosttySurfaceNeedsHost,
+            object: surfaceView,
+            userInfo: [SwiftUI.Notification.Name.SurfaceNeedsHostFocusedKey: wasFocused])
     }
 
     // MARK: Scrolling

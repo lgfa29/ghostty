@@ -334,6 +334,15 @@ extension Notification.Name {
 
     /// Focus the search field
     static let ghosttySearchFocus = Notification.Name("com.mitchellh.ghostty.searchFocus")
+
+    /// Sent with a surface view as the object when the view hosting it leaves the
+    /// window, so that another host for the same surface can take it back over.
+    /// See `SurfaceScrollView` surface ownership.
+    static let ghosttySurfaceNeedsHost = Notification.Name("com.mitchellh.ghostty.surfaceNeedsHost")
+
+    /// Bool. True if the surface was the first responder when it lost its host, so
+    /// that the new host can give it keyboard focus back.
+    static let SurfaceNeedsHostFocusedKey = ghosttySurfaceNeedsHost.rawValue + ".focused"
 }
 
 // NOTE: I am moving all of these to Notification.Name extensions over time. This
